@@ -73,7 +73,7 @@ def value_is_tensor_type(v):
 # for each aten type, how do we handle a return value of that type?
 RETURN_MAP = {
     'Tensor': 'assignTo(Output(${offset}),${output});',
-    'Scalar': 'assignTo(Output(${offset}),self.scalar_type(), ${output});',
+    'Scalar': 'assignTo(Output(${offset}),${output}.type(), ${output});',
     'bool': 'assignToValue<int64_t>(Output(${offset}),${output});',
     'int64_t': 'assignToValue<int64_t>(Output(${offset}),${output});',
     'std::vector<Tensor>': 'assignListStartingAt(${offset}, ${output});',
@@ -89,10 +89,9 @@ ARGUMENT_MAP = {
     'double': 'double ${arg} = readAttribute<float>("${arg}");',
     'int64_t': 'int64_t ${arg} = readAttribute<int64_t>("${arg}");',
     'IntArrayRef': 'auto ${arg} = readIntArrayRef("${arg}");',
-    'std::array<bool, 2>': 'auto ${arg} = readBoolMask<2>("${arg}");',
-    'std::array<bool, 3>': 'auto ${arg} = readBoolMask<3>("${arg}");',
+    'std::array<bool,2>': 'auto ${arg} = readBoolMask<2>("${arg}");',
+    'std::array<bool,3>': 'auto ${arg} = readBoolMask<3>("${arg}");',
 }
-
 
 def expand(o):
     num_defaults = sum(1 if 'default' in arg else 0 for arg in o['arguments'])
@@ -125,6 +124,10 @@ def supports(o, factory_methods):
     if "_out" in o['name']:
         return False
 
+    # skip if no return, previously it is 'void'
+    if len(o['returns']) == 0:
+        return False
+
     # skip return types we cannot handle
     for ret in o['returns']:
         if not value_has_tensors(ret) and ret['type'] not in RETURN_MAP:
@@ -151,12 +154,17 @@ OPTION_TEMPLATE = CT("""\
 case ${key}: { // ${name}
     ${initialization}
     run_op = [=] {
+        at::AutoNonVariableTypeMode guard;
         ${statements}
         auto the_result = ${invocation};
         ${assignments}
         return true;
     };
 } break;
+""")
+
+ASSIGN_CHECK_SIZE_TEMPLATE = CT("""\
+  if(OutputSize() > ${offset}) {${assignment}}
 """)
 
 
@@ -196,6 +204,15 @@ def find_factory_methods(decls):
         if any(arg['dynamic_type'] == 'TensorOptions' for arg in o['arguments']):
             factory_methods[o['name']] = 0
     return factory_methods
+
+
+def emit_assignments(o, env):
+    for i, r in enumerate(o['returns']):
+        t = RETURN_MAP[r['type'] if not value_is_tensor_type(r) else 'Tensor']
+        assignment = CT(t).substitute(env, offset=i, output=get_output(o, i))
+        check_size_assignment = ASSIGN_CHECK_SIZE_TEMPLATE.substitute(env, offset=i, assignment=assignment)
+
+        env['assignments'].append(check_size_assignment)
 
 
 if __name__ == '__main__':
@@ -258,10 +275,9 @@ if __name__ == '__main__':
                 # switch to indexing the "stack" from the end as if we only had
                 env['statements'].append(
                     'auto {} = peekSlice({}, InputSize() - {}, InputSize());'
-                        .format(arg['name'], real_inputs, static_tensor_inputs))
+                    .format(arg['name'], real_inputs, static_tensor_inputs))
             elif value_is_tensor_type(arg):
                 # load tensor inputs from Caffe2
-
                 env['statements'].append(
                     'auto {} = peek({}, {});'.format(arg['name'], real_inputs, view_length))
                 real_inputs += 1
@@ -269,10 +285,7 @@ if __name__ == '__main__':
                 init = CT(ARGUMENT_MAP[arg['type']]).substitute(env, arg=arg['name'])
                 env['initialization'].append(init)
 
-        for i, r in enumerate(o['returns']):
-            t = RETURN_MAP[r['type'] if not value_is_tensor_type(r) else 'Tensor']
-            assignment = CT(t).substitute(env, offset=i, output=get_output(o, i))
-            env['assignments'].append(assignment)
+        emit_assignments(o, env)
 
         if 'namespace' in o['method_of']:
             env['invocation'] = CT("at::${name}(${arguments})").substitute(env)

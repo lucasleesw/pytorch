@@ -10,7 +10,12 @@ namespace at { namespace native {
 // to benchmark than TH; I can't get gbenchmark to call fns from THTensor.cpp
 
 static inline void maybe_resize_storage_cpu(TensorImpl* self, int64_t new_size) {
-  if (new_size + self->storage_offset() > 0) {
+  // It does not make sense to try to resize a storage
+  // to hold 0 elements, and this can break
+  // if storage_offset is positive but
+  // new_size is 0, so just bail in that case
+  // (same comment is in Resize.cuh)
+  if (new_size > 0) {
     if (!THTensor_getStoragePtr(self)) {
       THTensor_stealAndSetStoragePtr(self, THStorage_new(self->dtype()));
     }
@@ -52,34 +57,61 @@ inline TensorImpl* resize_impl_cpu_(
   return self;
 }
 
-static inline int64_t computeStorageSize(IntArrayRef sizes, IntArrayRef strides) {
-  int64_t storage_size = 1;
-  for (size_t dim = 0; dim < sizes.size(); ++dim) {
-    if (sizes[dim] == 0) {
-      return 0;
-    }
-    storage_size += strides[dim] * (sizes[dim] - 1);
-  }
-  return storage_size;
-}
-
 static inline void checkInBoundsForStorage(
     IntArrayRef size,
     IntArrayRef stride,
     int64_t storage_offset,
     const Storage& new_storage) {
-  int64_t storage_size = computeStorageSize(size, stride);
+  int64_t storage_size = detail::computeStorageSize(size, stride);
   if (storage_size == 0) {
     // NB: (a tensor with arbitrary 0 dims)'s storage can have any numel.
     return;
   }
   int64_t new_storage_size = new_storage.numel();
-  AT_CHECK(
+  TORCH_CHECK(
       storage_offset + storage_size <= new_storage_size,
       "setStorage: sizes ", size, ", strides ", stride, ","
       " and storage offset ", storage_offset,
       " requiring a storage size of ", storage_size + storage_offset,
       " are out of bounds for storage with numel ", new_storage_size);
+}
+
+static inline void checkSetStorage(Tensor& result, Storage storage, int64_t storage_offset,
+                                   IntArrayRef size, IntArrayRef stride) {
+  // FIXME: stride should be optional
+  if (stride.data()) {
+    TORCH_CHECK(size.size() == stride.size(), "unequal size length (", size.size(),
+                                              ") and stride length (", stride.size(), ")");
+  }
+
+#ifdef DEBUG
+  TORCH_CHECK(size.size() <= INT_MAX, "size length (", size.size(), ") greater than INT_MAX");
+#endif
+
+  // storage: note this can't be replaced with result.set_(storage) as the semantics of that
+  // function is to set the tensor size to be equal to the size of the storage.
+  if (!result.storage().is_alias_of(storage)) {
+    // Caffe2 might have tensors whose storages are null, but we
+    // don't allow it in PyTorch.
+    TORCH_INTERNAL_ASSERT(storage);
+    TORCH_INTERNAL_ASSERT(result.storage());
+
+    // Caffe2 also has uninitialized dtype states, which we disallow here
+    TORCH_INTERNAL_ASSERT(result.storage().dtype() == storage.dtype());
+
+    // We used to allow this, but this breaks device caching.
+    // Let's put an actual error message for this one.
+    TORCH_CHECK(result.storage().device() == storage.device(),
+                "Attempted to set the storage of a tensor on device \"", result.storage().device(),
+                "\" to a storage on different device \"", storage.device(),
+                "\".  This is no longer allowed; the devices must match.");
+    result.unsafeGetTensorImpl()->set_storage(storage);
+  }
+
+  // storageOffset
+  if (storage_offset < 0) {
+    TORCH_CHECK("Tensor: invalid storage offset ", storage_offset);
+  }
 }
 
 /**
@@ -95,7 +127,7 @@ inline void setStrided(
   checkInBoundsForStorage(size, stride, storage_offset, self_->storage());
 
   /* storage offset */
-  AT_CHECK(storage_offset >= 0, "Tensor: invalid storage offset ", storage_offset);
+  TORCH_CHECK(storage_offset >= 0, "Tensor: invalid storage offset ", storage_offset);
   self_->set_storage_offset(storage_offset);
 
   /* size and stride */

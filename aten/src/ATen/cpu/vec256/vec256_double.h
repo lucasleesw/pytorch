@@ -17,6 +17,7 @@ template <> class Vec256<double> {
 private:
   __m256d values;
 public:
+  using value_type = double;
   static constexpr int size() {
     return 4;
   }
@@ -60,7 +61,14 @@ public:
     if (count == size())
       return _mm256_loadu_pd(reinterpret_cast<const double*>(ptr));
 
+
     __at_align32__ double tmp_values[size()];
+    // Ensure uninitialized memory does not change the output value See https://github.com/pytorch/pytorch/issues/32502
+    // for more details. We do not initialize arrays to zero using "={0}" because gcc would compile it to two
+    // instructions while a loop would be compiled to one instruction.
+    for (auto i = 0; i < size(); ++i) {
+      tmp_values[i] = 0.0;
+    }
     std::memcpy(
         tmp_values,
         reinterpret_cast<const double*>(ptr),
@@ -78,10 +86,15 @@ public:
   }
   const double& operator[](int idx) const  = delete;
   double& operator[](int idx) = delete;
+  int zero_mask() const {
+    // returns an integer mask where all zero elements are translated to 1-bit and others are translated to 0-bit
+    __m256d cmp = _mm256_cmp_pd(values, _mm256_set1_pd(0.0), _CMP_EQ_OQ);
+    return _mm256_movemask_pd(cmp);
+  }
   Vec256<double> map(double (*f)(double)) const {
-    __at_align32__ double tmp[4];
+    __at_align32__ double tmp[size()];
     store(tmp);
-    for (int64_t i = 0; i < 4; i++) {
+    for (int64_t i = 0; i < size(); i++) {
       tmp[i] = f(tmp[i]);
     }
     return loadu(tmp);
@@ -89,6 +102,18 @@ public:
   Vec256<double> abs() const {
     auto mask = _mm256_set1_pd(-0.f);
     return _mm256_andnot_pd(mask, values);
+  }
+  Vec256<double> angle() const {
+    return _mm256_set1_pd(0);
+  }
+  Vec256<double> real() const {
+    return *this;
+  }
+  Vec256<double> imag() const {
+    return _mm256_set1_pd(0);
+  }
+  Vec256<double> conj() const {
+    return *this;
   }
   Vec256<double> acos() const {
     return Vec256<double>(Sleef_acosd4_u10(values));
@@ -99,17 +124,26 @@ public:
   Vec256<double> atan() const {
     return Vec256<double>(Sleef_atand4_u10(values));
   }
+  Vec256<double> atan2(const Vec256<double> &b) const {
+    return Vec256<double>(Sleef_atan2d4_u10(values, b));
+  }
   Vec256<double> erf() const {
     return Vec256<double>(Sleef_erfd4_u10(values));
   }
   Vec256<double> erfc() const {
     return Vec256<double>(Sleef_erfcd4_u15(values));
   }
+  Vec256<double> erfinv() const {
+    return map(calc_erfinv);
+  }
   Vec256<double> exp() const {
     return Vec256<double>(Sleef_expd4_u10(values));
   }
   Vec256<double> expm1() const {
     return Vec256<double>(Sleef_expm1d4_u10(values));
+  }
+  Vec256<double> fmod(const Vec256<double>& q) const {
+    return Vec256<double>(Sleef_fmodd4(values, q));
   }
   Vec256<double> log() const {
     return Vec256<double>(Sleef_logd4_u10(values));
@@ -124,16 +158,16 @@ public:
     return Vec256<double>(Sleef_log1pd4_u10(values));
   }
   Vec256<double> sin() const {
-    return map(std::sin);
+    return Vec256<double>(Sleef_sind4_u10(values));
   }
   Vec256<double> sinh() const {
-    return map(std::sinh);
+    return Vec256<double>(Sleef_sinhd4_u10(values));
   }
   Vec256<double> cos() const {
-    return map(std::cos);
+    return Vec256<double>(Sleef_cosd4_u10(values));
   }
   Vec256<double> cosh() const {
-    return map(std::cos);
+    return Vec256<double>(Sleef_coshd4_u10(values));
   }
   Vec256<double> ceil() const {
     return _mm256_ceil_pd(values);
@@ -141,6 +175,7 @@ public:
   Vec256<double> floor() const {
     return _mm256_floor_pd(values);
   }
+  Vec256<double> frac() const;
   Vec256<double> neg() const {
     return _mm256_xor_pd(_mm256_set1_pd(-0.), values);
   }
@@ -148,13 +183,16 @@ public:
     return _mm256_round_pd(values, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
   }
   Vec256<double> tan() const {
-    return map(std::tan);
+    return Vec256<double>(Sleef_tand4_u10(values));
   }
   Vec256<double> tanh() const {
     return Vec256<double>(Sleef_tanhd4_u10(values));
   }
   Vec256<double> trunc() const {
     return _mm256_round_pd(values, (_MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
+  }
+  Vec256<double> lgamma() const {
+    return Vec256<double>(Sleef_lgammad4_u10(values));
   }
   Vec256<double> sqrt() const {
     return _mm256_sqrt_pd(values);
@@ -216,6 +254,11 @@ Vec256<double> inline operator/(const Vec256<double>& a, const Vec256<double>& b
   return _mm256_div_pd(a, b);
 }
 
+// frac. Implement this here so we can use subtraction.
+Vec256<double> Vec256<double>::frac() const {
+  return *this - this->trunc();
+}
+
 // Implements the IEEE 754 201X `maximum` operation, which propagates NaN if
 // either input is a NaN.
 template <>
@@ -237,6 +280,21 @@ Vec256<double> inline minimum(const Vec256<double>& a, const Vec256<double>& b) 
 }
 
 template <>
+Vec256<double> inline clamp(const Vec256<double>& a, const Vec256<double>& min, const Vec256<double>& max) {
+  return _mm256_min_pd(max, _mm256_max_pd(min, a));
+}
+
+template <>
+Vec256<double> inline clamp_min(const Vec256<double>& a, const Vec256<double>& min) {
+  return _mm256_max_pd(min, a);
+}
+
+template <>
+Vec256<double> inline clamp_max(const Vec256<double>& a, const Vec256<double>& max) {
+  return _mm256_min_pd(max, a);
+}
+
+template <>
 Vec256<double> inline operator&(const Vec256<double>& a, const Vec256<double>& b) {
   return _mm256_and_pd(a, b);
 }
@@ -252,7 +310,7 @@ Vec256<double> inline operator^(const Vec256<double>& a, const Vec256<double>& b
 }
 
 template <>
-void convert(const double* src, double* dst, int64_t n) {
+inline void convert(const double* src, double* dst, int64_t n) {
   int64_t i;
 #pragma unroll
   for (i = 0; i <= (n - Vec256<double>::size()); i += Vec256<double>::size()) {

@@ -1,6 +1,8 @@
 #include <caffe2/ideep/ideep_utils.h>
 
-namespace caffe2 {
+using namespace caffe2;
+
+namespace {
 
 void momentum_sgd_update(
     const int N,
@@ -71,7 +73,7 @@ class IDEEPMomentumSGDOp final : public IDEEPOperator {
   }
 
  protected:
-  float momentum_{0.9};
+  float momentum_ = 0.9f;
   bool nesterov_;
   INPUT_TAGS(GRAD, MOMENTUM, LR);
   OUTPUT_TAGS(OUTPUT_GRAD, OUTPUT_MOMENTUM);
@@ -113,7 +115,7 @@ class IDEEPMomentumSGDUpdateOp final : public IDEEPOperator {
   }
 
  protected:
-  float momentum_{0.9};
+  float momentum_ = 0.9f;
   bool nesterov_;
   INPUT_TAGS(GRAD, MOMENTUM, LR, PARAM);
   OUTPUT_TAGS(OUTPUT_GRAD, OUTPUT_MOMENTUM, OUTPUT_PARAM);
@@ -122,4 +124,4 @@ class IDEEPMomentumSGDUpdateOp final : public IDEEPOperator {
 REGISTER_IDEEP_OPERATOR(MomentumSGD, IDEEPMomentumSGDOp);
 REGISTER_IDEEP_OPERATOR(MomentumSGDUpdate, IDEEPMomentumSGDUpdateOp);
 
-} // namespace caffe2
+} // namespace

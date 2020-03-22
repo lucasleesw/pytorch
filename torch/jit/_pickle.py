@@ -1,24 +1,36 @@
-import pickle
+# These functions are referenced from the pickle archives produced by
+# ScriptModule.save()
 
 
-class TensorID(object):
-    def __setstate__(self, id):
-        self.id = id
+# These (`build_*`) functions used to be used by `pickler.cpp` to specify
+# the type of the list for certain special types, but now all lists get
+# a type attached and restored via `restore_type_tag` below. The legacy
+# functions should stick around for backwards-compatibility.
+
+def build_intlist(data):
+    return data
 
 
-class IntList(object):
-    def __setstate__(self, data):
-        self.data = data
+def build_tensorlist(data):
+    return data
 
 
-class Unpickler(pickle.Unpickler):
-    def find_class(self, module, name):
-        if not module == '__main__':
-            return None
+def build_doublelist(data):
+    return data
 
-        if name == 'TensorID':
-            return TensorID
-        elif name == 'IntList':
-            return IntList
-        elif name == 'LiteralTensor':
-            return LiteralTensor
+
+def build_boollist(data):
+    return data
+
+
+def build_tensor_from_id(data):
+    if isinstance(data, int):
+        # just the id, can't really do anything
+        return data
+
+
+def restore_type_tag(value, type_str):
+    # The type_ptr is used by the jit unpickler to restore the full static type
+    # to container types like list when they are re-loaded, but this doesn't
+    # matter for Python, so just return the plain value
+    return value

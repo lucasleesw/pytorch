@@ -30,6 +30,7 @@ class Optimizer(object):
     """
 
     def __init__(self, params, defaults):
+        torch._C._log_api_usage_once("python.optimizer")
         self.defaults = defaults
 
         if isinstance(params, torch.Tensor):
@@ -51,6 +52,7 @@ class Optimizer(object):
 
     def __getstate__(self):
         return {
+            'defaults': self.defaults,
             'state': self.state,
             'param_groups': self.param_groups,
         }
@@ -168,6 +170,10 @@ class Optimizer(object):
         Arguments:
             closure (callable): A closure that reevaluates the model and
                 returns the loss. Optional for most optimizers.
+
+        .. note::
+            Unless otherwise specified, this function should not modify the
+            ``.grad`` field of the parameters.
         """
         raise NotImplementedError
 

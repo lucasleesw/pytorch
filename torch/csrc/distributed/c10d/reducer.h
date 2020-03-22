@@ -15,17 +15,23 @@ namespace c10d {
 
 class Reducer {
  public:
-  // The constructor takes a vector<Variable> with model parameters for
-  // every model replica, hence the vector<vector<>>.
+  // The constructor takes a list of variables for every model replica.
+  // The bucket assignment for this reducer is specified as a list of
+  // buckets, each of which is specified as a list of indices into the
+  // variables list for **a single replica** (i.e. `variables[0]`).
   explicit Reducer(
-      std::vector<std::vector<torch::autograd::Variable>> variables,
-      std::shared_ptr<c10d::ProcessGroup> process_group);
+      std::vector<std::vector<torch::autograd::Variable>> replicas,
+      std::vector<std::vector<size_t>> bucket_indices,
+      std::shared_ptr<c10d::ProcessGroup> process_group,
+      std::vector<std::vector<bool>> expect_sparse_gradients);
+
+  ~Reducer() noexcept(false);
 
   // To (re-)initialize bucket assignment, pass a list of buckets, each
   // of which is specified by a list of indices in the variables list.
   // This function performs validation that the variables within a bucket
   // all live on the same device and have the same dimensionality.
-  void initialize_buckets(std::vector<std::vector<size_t>> indices);
+  void initialize_buckets(std::vector<std::vector<size_t>> bucket_indices);
 
   // This function is called when the forward function has produced an output,
   // and the user wishes to reduce gradients in the backwards pass.
@@ -42,21 +48,63 @@ class Reducer {
   }
 
  protected:
-  std::mutex mutex_;
-  std::vector<std::vector<torch::autograd::Variable>> variables_;
-  std::shared_ptr<c10d::ProcessGroup> process_group_;
+  // Forward declaration.
+  struct Bucket;
 
-  std::vector<std::vector<std::shared_ptr<torch::autograd::Function>>>
+  // Locates a specific variable by replica index and variable index.
+  struct VariableIndex {
+    size_t replica_index;
+    size_t variable_index;
+  };
+
+  std::mutex mutex_;
+  std::vector<std::vector<torch::autograd::Variable>> replicas_;
+  std::shared_ptr<c10d::ProcessGroup> process_group_;
+  std::vector<std::vector<bool>> expect_sparse_gradients_;
+
+  std::vector<std::vector<std::shared_ptr<torch::autograd::Node>>>
       grad_accumulators_;
-  std::unordered_map<torch::autograd::Function*, std::tuple<int, int>> func_;
+  std::unordered_map<torch::autograd::Node*, VariableIndex> func_;
+  std::vector<std::pair<uintptr_t, std::shared_ptr<torch::autograd::Node>>>
+      hooks_;
 
   bool expect_autograd_hooks_;
-  bool has_queued_final_callback_;
+  bool require_finalize_;
   size_t next_bucket_;
 
-  void mark_variable_ready(size_t replica_index, size_t variable_index);
+  bool has_marked_unused_parameters_;
+  std::vector<VariableIndex> unused_parameters_;
+  // Locally used parameter maps indicating if parameters are used locally
+  // during the current iteration or no_sync session if no_sync is on. One
+  // tensor for each model replica and each tensor is one-dim int32 tensor of
+  // number of parameters. These tensors are marked in autograd_hook to indicate
+  // the corresponding param has been used, and get allreduced in the end of
+  // backward of current iteration or no_sync session for figuring out the
+  // globally unused parameters.
+  //
+  // local_used_maps_:     CPU tensors for bookkeeping locally used params
+  // local_used_maps_dev_: dev tensors for reducing globally unused params
+  std::vector<at::Tensor> local_used_maps_;
+  std::vector<at::Tensor> local_used_maps_dev_;
+  // Indicate that reduction is done and D2H copy is done as well.
+  bool local_used_maps_reduced_;
+
+  // Work handle for allreduce on local_used_maps_
+  std::shared_ptr<c10d::ProcessGroup::Work> local_used_work_;
+
+  void mark_variable_ready_dense(VariableIndex index);
+
+  void mark_variable_ready_sparse(VariableIndex index);
+
+  void mark_variable_ready(VariableIndex index);
+
+  void autograd_hook(VariableIndex index);
 
   void mark_bucket_ready(size_t bucket_index);
+
+  void finalize_bucket_dense(Bucket& replica);
+
+  void finalize_bucket_sparse(Bucket& replica);
 
   void finalize_backward();
 
@@ -103,29 +151,35 @@ class Reducer {
   struct Bucket {
     std::vector<BucketReplica> replicas;
 
+    // Global indices of participating variables in the bucket
+    std::vector<size_t> variable_indices;
+
     // Number of replicas to be marked done before this bucket is ready.
     size_t pending;
 
     // Keep work handle around when this set of buckets is being reduced.
     std::shared_ptr<c10d::ProcessGroup::Work> work;
+
+    // If this bucket should expect a single sparse gradient.
+    // Implies: replicas[i].variables.size() == 1.
+    bool expect_sparse_gradient = false;
   };
 
   std::vector<Bucket> buckets_;
 
-  // A bucket index locates the position of a particular variable in the bucket
+  // A variable locator locates a particular variable in the bucket
   // structure. The `bucket_index` field points to the bucket in the `buckets_`
   // vector. The `intra_bucket_index` field points to the index of the variable
   // in any of the vector fields in the bucket replica.
-  struct BucketIndex {
+  struct VariableLocator {
     // Index into the `buckets_` variable.
     size_t bucket_index;
     // Index of parameter in single bucket replica.
     size_t intra_bucket_index;
   };
 
-  // Maps variable index to bucket indices. Bucketing across replicas is
-  // identical so no need to include the replica index here.
-  std::vector<BucketIndex> bucket_indices_;
+  // Map the index of a variable to its location in the bucket structure.
+  std::vector<VariableLocator> variable_locators_;
 
   // We collect the relative timestamp of every gradient being ready
   // when executing autograd. This can be used to derive a timeline of
@@ -133,5 +187,10 @@ class Reducer {
   int64_t backward_stats_base_;
   std::vector<std::vector<int64_t>> backward_stats_;
 };
+
+std::vector<std::vector<size_t>> compute_bucket_assignment_by_size(
+    const std::vector<at::Tensor>& tensors,
+    const std::vector<size_t>& bucket_size,
+    const std::vector<bool>& expect_sparse_gradient = {});
 
 } // namespace c10d

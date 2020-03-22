@@ -45,7 +45,10 @@ class DataParallel(Module):
 
     The batch size should be larger than the number of GPUs used.
 
-    See also: :ref:`cuda-nn-dataparallel-instead`
+    .. warning::
+        It is recommended to use :class:`~torch.nn.parallel.DistributedDataParallel`,
+        instead of this class, to do multi-GPU training, even if there is only a single
+        node. See: :ref:`cuda-nn-ddp-instead` and :ref:`ddp`.
 
     Arbitrary positional and keyword inputs are allowed to be passed into
     DataParallel but some types are specially handled. tensors will be
@@ -153,7 +156,7 @@ class DataParallel(Module):
         return self.gather(outputs, self.output_device)
 
     def replicate(self, module, device_ids):
-        return replicate(module, device_ids)
+        return replicate(module, device_ids, not torch.is_grad_enabled())
 
     def scatter(self, inputs, kwargs, device_ids):
         return scatter_kwargs(inputs, kwargs, device_ids, dim=self.dim)
